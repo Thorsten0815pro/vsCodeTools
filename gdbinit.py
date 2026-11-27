@@ -5,19 +5,21 @@ from __future__ import print_function
 import contextlib
 import functools
 import glob
+import itertools
 import sys
 import gdb
+import gdb.printing
 
 print('Python ' + sys.version)
 if sys.version_info.major < 3:
     print('Python 3 is required.')
-    exit(1)
+    raise RuntimeError('Python 3 is required.')  # exit() would terminate gdb
 
 # clear pretty printer list
 gdb.pretty_printers[:] = []
 
-# max nesting depth
-maxdepth: int = 3
+# max nesting depth (of pp())
+maxdepth: int = 10
 
 # max children
 maxchildren: int = 50
@@ -140,12 +142,15 @@ def std_vector_at(vector: gdb.Value, n: int) -> gdb.Value:
     elem_type = vector.type.template_argument(0)
     start = vector['_M_impl']['_M_start']
     finish = vector['_M_impl']['_M_finish']
-    elems = start.dereference().cast(elem_type.array(int(finish - start)))
+    size = int(finish - start)
+    if n < 0 or n >= size:
+        raise IndexError(f'index {n} out of range (size {size})')
+    elems = start.dereference().cast(elem_type.array(size))
     return elems[n]
 
 
 @trace
-@functools.cache
+@functools.lru_cache(maxsize=None)  # functools.cache needs Python 3.9
 def enum_value(enum: str) -> int:
     """Return the integer value of an enumeration."""
     return int(gdb.parse_and_eval(enum))
@@ -169,7 +174,7 @@ def type_has_field(typ: gdb.Type, name: str) -> bool:
     typ = typ.unqualified().strip_typedefs()
     try:
         fields = typ.fields()
-    except gdb.error:
+    except (gdb.error, TypeError):  # TypeError: not a struct type
         return False
     for field in fields:
         if field.name == name:
@@ -182,31 +187,139 @@ def has_field(val: gdb.Value, name: str) -> bool:
     """Return whether a value (or one of its base classes) has a field."""
     return type_has_field(val.type, name)
 
+
+def error_text(e: Exception) -> str:
+    """Return a short error text to be shown instead of a value."""
+    return f'<Fehler: {e}>'
+
+
+# current nesting depth of pp()
+pp_depth = 0
+
+
 @trace
 def pp(val: gdb.Value) -> str:
-    v = gdb.default_visualizer(val)
-    if v is None:
-        return str(val)
-    s = v.to_string()
-    if isinstance(s, gdb.LazyString):
-        return str(s.value())
-    return s
+    """Return the pretty printed value as string. Never raises."""
+    global pp_depth
+    if pp_depth >= maxdepth:
+        return '...'
+    pp_depth += 1
+    try:
+        v = gdb.default_visualizer(val)
+        if v is None:
+            return str(val)
+        s = v.to_string()
+        if isinstance(s, gdb.LazyString):
+            return str(s.value())
+        if s is None:  # printer shows children only
+            return '{...}'
+        return str(s)
+    except Exception as e:
+        return error_text(e)
+    finally:
+        pp_depth -= 1
+
+
+def printer_children(val: gdb.Value):
+    """Return the children of the pretty printer for a value (at most maxchildren)."""
+    printer = gdb.default_visualizer(val)
+    if printer is None or not hasattr(printer, 'children'):
+        return iter(())
+    return itertools.islice(printer.children(), maxchildren)
+
+
+def struct_children(val: gdb.Value):
+    """Return an iterator to the base classes and fields of a struct value."""
+    try:
+        if val.type.strip_typedefs().code in (gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF):
+            val = val.referenced_value()
+        fields = val.type.strip_typedefs().fields()
+    except Exception:
+        return
+    for f in fields:
+        if not hasattr(f, 'bitpos'):  # static member
+            continue
+        try:
+            if f.is_base_class:
+                yield f.name, val.cast(f.type)
+            else:
+                yield f.name or '<anon>', val[f]
+        except Exception:
+            continue
 
 
 def raw_children(self):
-    v = self.val
-    for f in v.type.strip_typedefs().fields():
-        if not hasattr(f, 'bitpos'):
-            continue
-        if f.is_base_class:
-            yield f.name, v.cast(f.type)
-        elif f.name:
-            yield f.name, v[f.name]
+    return struct_children(self.val)
 
 def with_children(cls):
     if not hasattr(cls, 'children'):
         cls.children = raw_children
     return cls
+
+
+# Exception safety: as soon as one printer raises, cpptools drops all
+# remaining children of a variable. So no printer may raise.
+
+def safe_to_string(fn):
+    """Wrap to_string(): show an error text instead of raising."""
+    @functools.wraps(fn)
+    def wrapper(self):
+        try:
+            return fn(self)
+        except Exception as e:
+            return error_text(e)
+    wrapper.safe = True
+    return wrapper
+
+
+def safe_children(fn):
+    """Wrap children(): stop at the first error instead of raising."""
+    @functools.wraps(fn)
+    def wrapper(self):
+        try:
+            for child in fn(self):
+                yield child
+        except Exception:
+            return
+    wrapper.safe = True
+    return wrapper
+
+
+def safe_display_hint(fn):
+    """Wrap display_hint(): no hint instead of raising."""
+    @functools.wraps(fn)
+    def wrapper(self):
+        try:
+            return fn(self)
+        except Exception:
+            return None
+    wrapper.safe = True
+    return wrapper
+
+
+def safe_printer(cls):
+    """Make to_string(), children() and display_hint() of a printer class exception safe."""
+    for name, wrap in (('to_string', safe_to_string),
+                       ('children', safe_children),
+                       ('display_hint', safe_display_hint)):
+        fn = cls.__dict__.get(name)
+        if callable(fn) and not getattr(fn, 'safe', False):
+            setattr(cls, name, wrap(fn))
+    return cls
+
+
+class SafeRegexpCollectionPrettyPrinter(gdb.printing.RegexpCollectionPrettyPrinter):
+    """RegexpCollectionPrettyPrinter whose lookup never raises (e.g. in a printer's __init__).
+
+    On error there is no printer (None) and gdb shows the value natively."""
+
+    def __call__(self, val):
+        try:
+            return super().__call__(val)
+        except Exception:
+            return None
+
+
 # STL pretty printers
 
 
@@ -268,6 +381,10 @@ class BoostUnorderedMapPrinter:
         """Return an interator to map content."""
         table = self.val['table_']
         buckets_arr = table['buckets_']
+        # at most maxchildren entries (two children each); visited guards
+        # against cyclic node chains
+        count = min(int(table['size_']), maxchildren)
+        visited = set()
 
         if has_field(buckets_arr, 'buckets'):  # boost >= 1.87 (fca)
             # bucket array with one node chain per bucket; the bucket at
@@ -275,8 +392,11 @@ class BoostUnorderedMapPrinter:
             buckets = buckets_arr['buckets']
             n = 0
             for i in range(int(buckets_arr['size_'])):
+                if n >= 2 * count:
+                    return
                 node_ptr = (buckets + i).dereference()['next']
-                while int(node_ptr) != 0:
+                while int(node_ptr) != 0 and int(node_ptr) not in visited and n < 2 * count:
+                    visited.add(int(node_ptr))
                     node = node_ptr.dereference()
                     pair = node['buf']['t_']
                     yield str(n), pair['first']
@@ -298,7 +418,8 @@ class BoostUnorderedMapPrinter:
         node_ptr = first_node['next_']
 
         n = 0
-        while int(node_ptr) != 0:
+        while int(node_ptr) != 0 and int(node_ptr) not in visited and n < 2 * count:
+            visited.add(int(node_ptr))
             node = node_ptr.dereference()
             node_ptr = node['next_']
             buf = node.cast(node_type)['value_base_']['data_']['data_']['buf']
@@ -315,9 +436,11 @@ class BoostUnorderedMapPrinter:
 @trace
 def build_boost_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
     """Build boost pretty printer collection."""
-    pp = gdb.printing.RegexpCollectionPrettyPrinter('Boost')
+    pp = SafeRegexpCollectionPrettyPrinter('Boost')
     pp.add_printer('Optional', '^boost::optional<.*$', BoostOptionalPrinter)
     pp.add_printer('UnorderedMap', '^boost::unordered::unordered_map<.*$', BoostUnorderedMapPrinter)
+    for sp in pp.subprinters:
+        safe_printer(sp.gen_printer)
     return pp
 
 
@@ -366,7 +489,7 @@ class QStringPrinter:
         encoding = 'utf-16-le' if sys.byteorder == 'little' else 'utf-16-be'
         if truncated:
             result += '[...]'.encode(encoding)
-        return result.decode(encoding)
+        return result.decode(encoding, errors='replace')
 
     def display_hint(self) -> str:
         """Return display hint (string/array/map)."""
@@ -511,6 +634,7 @@ class QListIterator:
             self.ptr_size = gdb.lookup_type('void').pointer().sizeof
             self.count = int(d['end'])
             self.i = int(d['begin'])
+        self.count = min(self.count, self.i + maxchildren)
 
     def __next__(self):
         """Return next value from list."""
@@ -584,13 +708,15 @@ class QVariantPrinter:
 @trace
 def build_qt_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
     """Build Qt pretty printer collection."""
-    pp = gdb.printing.RegexpCollectionPrettyPrinter('Qt')
+    pp = SafeRegexpCollectionPrettyPrinter('Qt')
     pp.add_printer('QDate', '^QDate$', QDatePrinter)
     pp.add_printer('QTime', '^QTime$', QTimePrinter)
     pp.add_printer('QDateTime', '^QDateTime$', QDateTimePrinter)
     pp.add_printer('QString', '^QString$', QStringPrinter)
     pp.add_printer('QVariant', '^QVariant$', QVariantPrinter)
     pp.add_printer('QList', '^QList<.*>$', QListPrinter)
+    for sp in pp.subprinters:
+        safe_printer(sp.gen_printer)
     return pp
 
 
@@ -605,6 +731,7 @@ register_qt_printers(None)
 
 # Auto dereference pointers, references and typdefs.
 
+@safe_printer
 class DynamicPtrPrinter:
     def __init__(self, val):
         self.val = val
@@ -612,57 +739,61 @@ class DynamicPtrPrinter:
         return f'({self.val.dynamic_type}) {int(self.val):#x}'
 
     def children(self):
-        obj = self.val.cast(self.val.dynamic_type).dereference()
         try:
-            fields = obj.type.strip_typedefs().fields()
-        except gdb.error:
-            return
-        for f in fields:
-            if not hasattr(f, 'bitpos'):
-                continue
-            try:
-                if f.is_base_class:
-                    yield f.name, obj.cast(f.type)
-                else:
-                    yield f.name or '<anon>', obj[f]
-            except gdb.error:
-                continue
-            
+            obj = self.val.cast(self.val.dynamic_type).dereference()
+        except Exception:
+            return iter(())
+        return struct_children(obj)
 
 
 @trace
 def deref_printers(val: gdb.Value):
     """Auto dereference pointers, references and typdefs."""
-    if val.type.code == gdb.TYPE_CODE_PTR and int(val) != 0:
-        # cast to derived type
-        if val.dynamic_type != val.type:
-            derived = val.cast(val.dynamic_type)
-            printer = gdb.default_visualizer(derived.dereference())
-            return printer if printer is not None else DynamicPtrPrinter(val)
-        # dereference references and pointers (except void*)
-        if val.type.target().code != gdb.TYPE_CODE_VOID:
-            return gdb.default_visualizer(val.referenced_value())
-    if val.type.code == gdb.TYPE_CODE_REF or val.type.code == gdb.TYPE_CODE_RVALUE_REF:
-        try:
+    if not deref:
+        return None
+    # Must never raise (see safe_printer). Without a printer of our own
+    # (None) gdb shows the value natively.
+    try:
+        if val.type.code == gdb.TYPE_CODE_PTR:
+            if int(val) == 0:
+                return None
+            # cast to derived type
+            if val.dynamic_type != val.type:
+                derived = val.cast(val.dynamic_type).dereference()
+                derived.fetch_lazy()  # unreadable memory: show the pointer natively
+                printer = gdb.default_visualizer(derived)
+                return printer if printer is not None else DynamicPtrPrinter(val)
+            # dereference pointers (except void*)
+            if val.type.target().strip_typedefs().code != gdb.TYPE_CODE_VOID:
+                target = val.referenced_value()
+                target.fetch_lazy()
+                return gdb.default_visualizer(target)
+            return None
+        if val.type.code == gdb.TYPE_CODE_REF or val.type.code == gdb.TYPE_CODE_RVALUE_REF:
             target = val.referenced_value()
             dyn = target.dynamic_type
             if dyn.strip_typedefs().unqualified() != target.type.strip_typedefs().unqualified():
                 target = target.cast(dyn)
+            target.fetch_lazy()
             return gdb.default_visualizer(target)
-        except (gdb.error, gdb.MemoryError):
-            return None
-    if val.type.code == gdb.TYPE_CODE_TYPEDEF:
-        try:
+        if val.type.code == gdb.TYPE_CODE_TYPEDEF:
             return gdb.default_visualizer(val.cast(val.type.strip_typedefs()))
-        except Exception:
+        typename = str(val.type)
+        if typename.startswith('std::shared_ptr<'):
+            ptr = dereference_shared_ptr(val)
+        elif typename.startswith('std::unique_ptr<'):
+            ptr = dereference_unique_ptr(val)
+        elif typename.startswith('std::weak_ptr<'):
+            ptr = dereference_weak_ptr(val)
+        else:
             return None
-    if str(val.type).startswith('std::shared_ptr<'):
-        return gdb.default_visualizer(dereference_shared_ptr(val).dereference())
-    if str(val.type).startswith('std::unique_ptr<'):
-        return gdb.default_visualizer(dereference_unique_ptr(val).dereference())
-    if str(val.type).startswith('std::weak_ptr<'):
-        return gdb.default_visualizer(dereference_weak_ptr(val).dereference())
-    return None
+        if int(ptr) == 0:
+            return None
+        target = ptr.dereference()
+        target.fetch_lazy()
+        return gdb.default_visualizer(target)
+    except Exception:
+        return None
 
 
 # Needs to be the very first printer.
@@ -735,11 +866,20 @@ class LongFlagsPrinter:
     def to_string(self) -> str:
         enum_type = self.val.type.template_argument(0)
         length = int(str(self.val.type.template_argument(1)))
-        value = int(self.val['m_bits']['_M_w'])
+        words = self.val['m_bits']['_M_w']  # std::bitset: one word, or an array for > 64 bits
+        words_type = words.type.strip_typedefs()
+        if words_type.code == gdb.TYPE_CODE_ARRAY:
+            low, high = words_type.range()
+            word_bits = words_type.target().sizeof * 8
+            value = 0
+            for k in range(low, high + 1):
+                value |= (int(words[k]) & ((1 << word_bits) - 1)) << ((k - low) * word_bits)
+        else:
+            value = int(words)
         result = ''
         for i in range(0, length):
             if (1 << i) & value != 0:
-                result += f'{pp(gdb.Value(i.to_bytes(4, byteorder=sys.byteorder, signed=False), enum_type))}|'
+                result += f'{pp(gdb.Value(i.to_bytes(enum_type.sizeof, byteorder=sys.byteorder, signed=False), enum_type))}|'
         if len(result) > 0:
             result = result[:-1]
         return result
@@ -761,7 +901,7 @@ class BoolArrayPrinter:
             shift = (i - base) % 32
             mask = 1 << (32 - 1 - shift)
             if values[index] & mask != 0:
-                result += f'{gdb.default_visualizer(gdb.Value(i.to_bytes(4, byteorder=sys.byteorder, signed=False), enum_type)).to_string()}|'
+                result += f'{pp(gdb.Value(i.to_bytes(enum_type.sizeof, byteorder=sys.byteorder, signed=False), enum_type))}|'
         if len(result) > 0:
             result = result[:-1]
         return result
@@ -771,21 +911,31 @@ class BoolArrayPrinter:
 class SetVectorPrinter:
     def __init__(self, val: gdb.Value):
         self.val = val
+        self.printer = None  # no vector member or no printer for it: show raw fields
         try:
             self.printer = gdb.default_visualizer(self.val['m_vecData'])
         except Exception:
-            self.printer = gdb.default_visualizer(self.val['m_impl']['m_data'])
+            try:
+                self.printer = gdb.default_visualizer(self.val['m_impl']['m_data'])
+            except Exception:
+                pass
 
     def __iter__(self):
         return self.printer.__iter__()
 
     def to_string(self) -> str:
+        if self.printer is None:
+            return None
         return self.printer.to_string()
 
     def children(self):
-        return self.printer.children()
+        if self.printer is None:
+            return raw_children(self)
+        return itertools.islice(self.printer.children(), maxchildren)
 
     def display_hint(self):
+        if self.printer is None:
+            return None
         return self.printer.display_hint()
 
 
@@ -823,13 +973,13 @@ class UnitPrinter:
             hours = 0
             days = 0
             result = ''
-            if seconds > 86400:
+            if seconds >= 86400:
                 days = int(seconds / 86400)
                 seconds = seconds - days * 86400
-            if seconds > 3600:
+            if seconds >= 3600:
                 hours = int(seconds / 3600)
                 seconds = seconds - hours * 3600
-            if seconds > 60:
+            if seconds >= 60:
                 minutes = int(seconds / 60)
                 seconds = seconds - minutes * 60
             if 'Duration' in str(self.val.type):
@@ -864,7 +1014,7 @@ class DiscreteUnitPrinter:
     def __init__(self, val: gdb.Value):
         self.val = val
 
-    def to_string(self) -> str | gdb.LazyString:
+    def to_string(self) -> str:  # 'str | gdb.LazyString' needs Python 3.10
         amount = float(self.val['m_amount'])
         factor = float(str(self.val.type.template_argument(2)))
         return str(amount / factor)
@@ -912,18 +1062,22 @@ class DezimalZeitPrinter:
         hours = 0
         days = 0
         result = ''
-        if seconds > 86400:
+        if seconds < 0:
+            result += '-'
+            seconds = -seconds
+        if seconds >= 86400:
             days = int(seconds / 86400)
             seconds = seconds - days * 86400
-        if seconds > 3600:
+        if seconds >= 3600:
             hours = int(seconds / 3600)
             seconds = seconds - hours * 3600
-        if seconds > 60:
+        if seconds >= 60:
             minutes = int(seconds / 60)
             seconds = seconds - minutes * 60
         if days > 0:
             result += str(days) + 'd '
-        return f'{hours:02}:{minutes:02}:{seconds:02}'
+        result += f'{hours:02}:{minutes:02}:{seconds:02}'
+        return result
 
 
 @trace_class
@@ -1035,13 +1189,16 @@ class KnotenPrinter:
         self.val = val
 
     def print_id(self) -> str:
-        strecke = pp(self.val['m_pStrecke'])
-        kid = int(self.val['m_stId']['m_uiValueArray'][1])
-        return f'{strecke}/{kid}'
+        try:
+            strecke = pp(self.val['m_pStrecke'])
+            kid = int(self.val['m_stId']['m_uiValueArray'][1])
+            return f'{strecke}/{kid}'
+        except Exception as e:
+            return error_text(e)
 
     def print_name(self) -> str:
         if self.val['m_eKnotenTyp'] == 1:
-            return 'Auflösekontekt'
+            return 'Auflösekontakt'
         elif self.val['m_eKnotenTyp'] == 2:
             return 'Balise'
         elif self.val['m_eKnotenTyp'] == 3:
@@ -1063,15 +1220,17 @@ class KnotenPrinter:
         else:
             try:
                 type_name = self.val.type.name
+                if not type_name:  # e.g. reference type
+                    return 'Unbekannt'
                 colon_pos = type_name.rfind('::')
                 if colon_pos != -1:
                     type_name = type_name[colon_pos + 2:]
-                    return type_name
+                return type_name
             except Exception:
                 return 'Unbekannt'
 
     def to_string(self) -> str:
-        return self.print_name() + ' ' + self.print_id()
+        return f'{self.print_name()} {self.print_id()}'
 
 
 @trace_class
@@ -1192,11 +1351,13 @@ class LinkedListIterator:
         self.val = val
         self.current = self.val['m_pFront']
         self.i = 0
+        self.visited = set()  # guards against cyclic lists
 
     def __next__(self):
-        if int(self.current) == 0:
+        if int(self.current) == 0 or int(self.current) in self.visited or self.i >= maxchildren:
             raise StopIteration
         current = self.current
+        self.visited.add(int(current))
         self.current = self.current.dereference()['m_pNext']
         self.i += 1
         return (str(self.i), current)
@@ -1249,9 +1410,8 @@ class FahrwegBlockPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        bloecke = gdb.default_visualizer(self.val['m_stBloecke'])
         sbloecke = '[ '
-        for child in bloecke.children():
+        for child in printer_children(self.val['m_stBloecke']):
             sbloecke += pp(child[1]) + ', '
         if sbloecke[-2] == ',':
             sbloecke = sbloecke[:-2]
@@ -1430,9 +1590,8 @@ class BerechnungsZugPrinter:  # RailSys >= 12.6
             styp = 'A'
         elif typ == enum_value('RSBetrieb::EBerechnungsZugTyp::TemporaererZug'):
             styp = 'T'
-        obj = gdb.default_visualizer(zuege)
         zuegestr = ''
-        for child in obj.children():
+        for child in printer_children(zuege):
             zugstr = pp(child[1])
             zuegestr += zugstr + ','
         zuegestr = zuegestr[:-1]
@@ -1447,17 +1606,30 @@ class KantenBelegungPrinter:
     def print_zeiten(self) -> str:
         current: gdb.Value = self.val
         result: list[str] = []
+        visited = {getaddr(current)}  # guards against cyclic m_pFolgeKante chains
         while True:
-            typ = int(current['m_stData']['m_stBits']['m_eBelegungsTyp'])
-            reservierungszeit = pp(current['m_zReservierungszeit'])
-            belegzeit = pp(current['m_zBelegzeit'])
-            endebildezeit = pp(current['m_zEndeBildezeit'])
-            kantenankunft = pp(current['m_zKantenankunft'])
-            aufloesezeit = pp(current['m_zAufloesezeit'])
-            result.append(f'{"Block" if typ == 0 else "DWeg"} {reservierungszeit} {belegzeit} {endebildezeit} {kantenankunft} {aufloesezeit}')
-            if current['m_pFolgeKante'] == 0:
+            if len(result) >= maxchildren:
+                result.append('...')
+                break
+            try:
+                typ = int(current['m_stData']['m_stBits']['m_eBelegungsTyp'])
+                reservierungszeit = pp(current['m_zReservierungszeit'])
+                belegzeit = pp(current['m_zBelegzeit'])
+                endebildezeit = pp(current['m_zEndeBildezeit'])
+                kantenankunft = pp(current['m_zKantenankunft'])
+                aufloesezeit = pp(current['m_zAufloesezeit'])
+                result.append(f'{"Block" if typ == 0 else "DWeg"} {reservierungszeit} {belegzeit} {endebildezeit} {kantenankunft} {aufloesezeit}')
+                folgekante = int(current['m_pFolgeKante'])
+            except Exception as e:
+                result.append(error_text(e))
+                break
+            if folgekante == 0:
                 result.append('nullptr')
-                break;
+                break
+            if folgekante in visited:
+                result.append('<Zyklus>')
+                break
+            visited.add(folgekante)
             try:
                 current = current['m_pFolgeKante'].dereference()
             except Exception:
@@ -1517,8 +1689,16 @@ class ZugfahrtPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        zug = gdb.default_visualizer(dereference_shared_ptr(self.val['m_pZug'])).to_string()
-        aktpar = gdb.default_visualizer(dereference_unique_ptr(self.val['m_pAktPar'])).to_string()
+        try:
+            zug_ptr = dereference_shared_ptr(self.val['m_pZug'])
+            zug = pp(zug_ptr) if int(zug_ptr) != 0 else '<kein Zug>'
+        except Exception as e:
+            zug = error_text(e)
+        try:
+            aktpar_ptr = dereference_unique_ptr(self.val['m_pAktPar'])
+            aktpar = pp(aktpar_ptr) if int(aktpar_ptr) != 0 else '<keine AktPar>'
+        except Exception as e:
+            aktpar = error_text(e)
         return f'Zugfahrt {zug}, {aktpar}'
 
 
@@ -1533,19 +1713,19 @@ class OpDayAbschnittPrinter:
         gueltigkeit = pp(self.val['m_stGueltigkeitsZeitraum'])
         zusatztage = '{ '
         if has_field(self.val['m_stZusatztage'], 'm_vecData'):
-            for day in gdb.default_visualizer(self.val['m_stZusatztage']['m_vecData']).children():
-                zusatztage = zusatztage + gdb.default_visualizer(day[1]).to_string() + ', '
+            for day in printer_children(self.val['m_stZusatztage']['m_vecData']):
+                zusatztage = zusatztage + pp(day[1]) + ', '
         else:
-            zusatztage += gdb.default_visualizer(self.val['m_stZusatztage']).to_string() + ' '
+            zusatztage += pp(self.val['m_stZusatztage']) + ' '
         zusatztage += '}'
         ausnahmetage = '{ '
         if has_field(self.val['m_stAusnahmetage'], 'm_vecData'):
-            for day in gdb.default_visualizer(self.val['m_stAusnahmetage']['m_vecData']).children():
-                ausnahmetage = ausnahmetage + gdb.default_visualizer(day[1]).to_string() + ', '
+            for day in printer_children(self.val['m_stAusnahmetage']['m_vecData']):
+                ausnahmetage = ausnahmetage + pp(day[1]) + ', '
         else:
-            ausnahmetage += gdb.default_visualizer(self.val['m_stAusnahmetage']).to_string() + ' '
+            ausnahmetage += pp(self.val['m_stAusnahmetage']) + ' '
         ausnahmetage += '}'
-        days = gdb.default_visualizer(self.val['m_stNummernCode']).to_string()
+        days = pp(self.val['m_stNummernCode'])
         return f'[ {gueltigkeit} {days} Z: {zusatztage} A: {ausnahmetage} ]'
 
 
@@ -1556,9 +1736,9 @@ class OpDayPrinter:
 
     def to_string(self) -> str:
         result = '[ Abschnitte: { '
-        for abschnitt in gdb.default_visualizer(self.val['m_stVtAbschnitte']).children():
-            result = result + gdb.default_visualizer(abschnitt[1]).to_string() + ', '
-        return result + '} VT-Text: "' + gdb.default_visualizer(self.val['m_sVerkehrstageText']).to_string() + '" ]'
+        for abschnitt in printer_children(self.val['m_stVtAbschnitte']):
+            result = result + pp(abschnitt[1]) + ', '
+        return result + '} VT-Text: "' + pp(self.val['m_sVerkehrstageText']) + '" ]'
 
 
 @trace_class
@@ -1567,8 +1747,8 @@ class VerkehrsTageBausteinPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        key = gdb.default_visualizer(self.val['m_Key']).to_string()
-        opday = gdb.default_visualizer(self.val['m_OpDay']).to_string()
+        key = pp(self.val['m_Key'])
+        opday = pp(self.val['m_OpDay'])
         return f'"{key}" {opday}'
 
 
@@ -1578,7 +1758,7 @@ class BausteinDataPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        return gdb.default_visualizer(self.val['m_sKuerzel']).to_string()
+        return pp(self.val['m_sKuerzel'])
 
 
 @trace_class
@@ -1587,14 +1767,14 @@ class TWennXPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        item = gdb.default_visualizer(self.val['m_item']).to_string()
+        item = pp(self.val['m_item'])
         werktags = bool(self.val['m_bNurWerktags'])
         return item + (' w.X' if werktags else '')
 
 
 @trace
 def build_rs_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
-    pp = gdb.printing.RegexpCollectionPrettyPrinter('RailSys')
+    pp = SafeRegexpCollectionPrettyPrinter('RailSys')
     pp.add_printer('AktualParameter', '^RSBetrieb::Zugfahrt::AktualParameter$', AktualParameterPrinter)
     pp.add_printer('Anzeiger', '^RSInfra::Anzeiger$', KnotenPrinter)  # TODO
     pp.add_printer('Bahnhof', '^RSInfra::Bahnhof$', BahnhofPrinter)
@@ -1658,7 +1838,7 @@ def build_rs_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
     pp.add_printer('Zug', '^RSBetrieb::Zug$', ZugPrinter)
     pp.add_printer('Zugfahrt', '^(RSBetrieb::Zugfahrt::(((VSoll)?Base|Belegung|VMax)Zugfahrt)|RSSimu::(ZugfahrtMitVerspaetungsBerechner|PrognoseZugfahrt|Zugfahrt)|Mock::Zugfahrt)$', ZugfahrtPrinter)
     for sp in pp.subprinters:
-        with_children(sp.gen_printer)
+        safe_printer(with_children(sp.gen_printer))
     return pp
 
 
