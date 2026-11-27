@@ -6,9 +6,12 @@ import contextlib
 import functools
 import glob
 import itertools
+import re
 import sys
+import types
 import gdb
 import gdb.printing
+import gdb.types
 
 print('Python ' + sys.version)
 if sys.version_info.major < 3:
@@ -18,29 +21,30 @@ if sys.version_info.major < 3:
 # clear pretty printer list
 gdb.pretty_printers[:] = []
 
-# max nesting depth (of pp())
+# max nesting depth (of pp() and of the automatic dereferencing)
 maxdepth: int = 10
 
 # max children
 maxchildren: int = 50
 
-# indentation width = 4
-indent: int = 2
-
 # automatic dereferencing of pointers and references
 deref: bool = True
+
+# read the target before dereferencing (fetch_lazy): unreadable memory shows
+# the plain pointer instead of <Fehler: ...>; False is faster for big objects
+deref_probe: bool = True
 
 # max string length
 maxstrlen: int = 80
 
-# print adresses on each dereference
+# print adresses on each dereference (@0x...: value)
 printaddr: bool = False
 
 print('Options:')
 print(f'py maxdepth = {maxdepth}')
 print(f'py maxchildren = {maxchildren}')
-print(f'py indent = {indent}')
 print(f'py deref = {deref}')
+print(f'py deref_probe = {deref_probe}')
 print(f'py maxstrlen = {maxstrlen}')
 print(f'py printaddr = {printaddr}')
 
@@ -96,8 +100,70 @@ def trace_class(cls):
 
 
 @trace
+def tuple_element(val: gdb.Value, n: int) -> gdb.Value:
+    """Return the nth value from a std::tuple by walking its base classes (like the libstdc++ printer)."""
+    # tuple<T0, T1, ...> : _Tuple_impl<0, T0, T1, ...>
+    # _Tuple_impl<i, Ti, ...> : _Tuple_impl<i + 1, ...>, _Head_base<i, Ti>
+    # (the last _Tuple_impl has the _Head_base only)
+    fields = val.type.strip_typedefs().fields()
+    if not fields or not fields[0].is_base_class:
+        raise gdb.error(f'unknown tuple layout: {val.type}')
+    impl = val.cast(fields[0].type)
+    for _ in range(n):
+        fields = impl.type.strip_typedefs().fields()
+        if len(fields) != 2 or not fields[0].is_base_class:
+            raise IndexError(f'tuple index {n} out of range')
+        impl = impl.cast(fields[0].type)
+    fields = impl.type.strip_typedefs().fields()
+    if not fields or not fields[-1].is_base_class:
+        raise gdb.error(f'unknown tuple layout: {impl.type}')
+    return head_value(impl.cast(fields[-1].type))
+
+
+def head_value(head: gdb.Value) -> gdb.Value:
+    """Return the value stored in a std::_Head_base."""
+    fields = head.type.strip_typedefs().fields()
+    if fields and fields[0].name == '_M_head_impl':
+        return head['_M_head_impl']
+    if fields and fields[0].is_base_class:  # empty base optimization
+        return head.cast(fields[0].type)
+    raise gdb.error(f'unknown tuple layout: {head.type}')
+
+
+head_base_re = re.compile(r'_Head_base<\s*(\d+)')  # gcc: _Head_base<0, ...>, clang: _Head_base<0UL, ...>
+
+
+def find_head_base(val: gdb.Value, n: int, depth: int = 0):
+    """Return the base class _Head_base<n, ...> of a tuple, searched recursively (None if none)."""
+    if depth >= maxdepth:
+        return None
+    for f in val.type.strip_typedefs().fields():
+        if not f.is_base_class:
+            continue
+        base = val.cast(f.type)
+        match = head_base_re.search(f.name or str(f.type))
+        if match and int(match.group(1)) == n:
+            return base
+        found = find_head_base(base, n, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+@trace
 def dereference_tuple(val: gdb.Value, n: int) -> gdb.Value:
     """Return the nth value fron a tuple."""
+    # The base classes first: no symbol lookup, no compiler specific names
+    # (clang names it _Head_base<0UL, ...>).
+    try:
+        return tuple_element(val, n)
+    except Exception:  # unknown layout: search _Head_base<n, ...> among all base classes
+        pass
+    with contextlib.suppress(Exception):
+        head = find_head_base(val, n)
+        if head is not None:
+            return head_value(head)
+    # last resort: look _Head_base up by name
     elem_typename = str(val.type.template_argument(n))
     try:
         pointer_typename = f'std::_Head_base<{n}, {elem_typename}, false>'
@@ -109,22 +175,93 @@ def dereference_tuple(val: gdb.Value, n: int) -> gdb.Value:
 
 
 @trace
+def compressed_pair_first(val: gdb.Value) -> gdb.Value:
+    """Return the first value of a libc++ __compressed_pair."""
+    typ = val.type.strip_typedefs()
+    if typ.code != gdb.TYPE_CODE_STRUCT:  # libc++ >= 19: plain member (_LIBCPP_COMPRESSED_PAIR)
+        return val
+    # __compressed_pair<T1, T2> : __compressed_pair_elem<T1, 0>, __compressed_pair_elem<T2, 1>
+    return val.cast(typ.fields()[0].type)['__value_']
+
+
+@trace
 def dereference_unique_ptr(val: gdb.Value) -> gdb.Value:
-    """Return the raw pointer contained in a std::unique_ptr."""
+    """Return the raw pointer contained in a std::unique_ptr (libstdc++ or libc++)."""
+    if has_field(val, '__ptr_'):  # libc++
+        return compressed_pair_first(val['__ptr_'])
     # Alt: return val['_M_t']['_M_t']['_M_head_impl']
-    return dereference_tuple(val['_M_t']['_M_t'], 0)
+    impl = val['_M_t']
+    if has_field(impl, '_M_t'):  # __uniq_ptr_impl / __uniq_ptr_data (GCC >= 7), else std::tuple
+        impl = impl['_M_t']
+    return dereference_tuple(impl, 0)
 
 
 @trace
 def dereference_shared_ptr(val: gdb.Value) -> gdb.Value:
-    """Return the raw pointer contained in a std::shared_ptr."""
+    """Return the raw pointer contained in a std::shared_ptr (libstdc++ or libc++)."""
+    if has_field(val, '__ptr_'):  # libc++
+        return val['__ptr_']
     return val['_M_ptr']
 
 
 @trace
 def dereference_weak_ptr(val: gdb.Value) -> gdb.Value:
-    """Return the raw pointer contained in a std::weak_ptr."""
+    """Return the raw pointer contained in a std::weak_ptr (None: expired)."""
+    if has_field(val, '__cntrl_'):  # libc++: __shared_owners_ is the use count - 1
+        cntrl = val['__cntrl_']
+        if int(cntrl) == 0 or scalar_value(cntrl['__shared_owners_']) < 0:
+            return None
+        return val['__ptr_']
+    pi = val['_M_refcount']['_M_pi']
+    if int(pi) == 0 or scalar_value(pi['_M_use_count']) <= 0:
+        return None
     return val['_M_ptr']
+
+
+@trace
+def dereference_qweak_pointer(val: gdb.Value) -> gdb.Value:
+    """Return the raw pointer contained in a QWeakPointer (None: object deleted)."""
+    d = val['d']
+    if int(d) != 0 and scalar_value(d['strongref']) <= 0:
+        return None
+    return val['value']
+
+
+@trace
+def dereference_qpointer(val: gdb.Value) -> gdb.Value:
+    """Return the raw pointer contained in a QPointer (None: object deleted)."""
+    if has_field(val, 'wp'):  # Qt5/Qt6: QWeakPointer<QObject>
+        ptr = dereference_qweak_pointer(val['wp'])
+    else:  # Qt4
+        ptr = val['o']
+    if ptr is None:
+        return None
+    return ptr.cast(val.type.strip_typedefs().template_argument(0).pointer())
+
+
+@trace
+def dereference_boost_weak_ptr(val: gdb.Value) -> gdb.Value:
+    """Return the raw pointer contained in a boost::weak_ptr (None: expired)."""
+    pi = val['pn']['pi_']
+    if int(pi) == 0 or scalar_value(pi['use_count_']) <= 0:
+        return None
+    return val['px']
+
+
+# smart pointer template -> function returning its raw pointer (None: expired)
+smart_pointers = {
+    'std::shared_ptr': dereference_shared_ptr,
+    'std::unique_ptr': dereference_unique_ptr,
+    'std::weak_ptr': dereference_weak_ptr,
+    'QSharedPointer': lambda val: val['value'],
+    'QWeakPointer': dereference_qweak_pointer,
+    'QPointer': dereference_qpointer,
+    'QScopedPointer': lambda val: val['d'],
+    'boost::shared_ptr': lambda val: val['px'],
+    'boost::weak_ptr': dereference_boost_weak_ptr,
+    'boost::scoped_ptr': lambda val: val['px'],
+    'boost::intrusive_ptr': lambda val: val['px'],
+}
 
 
 @trace
@@ -159,7 +296,7 @@ def enum_value(enum: str) -> int:
 @trace
 def getaddr(val: gdb.Value) -> int:
     """Return ther address if a value."""
-    if val.type.code == gdb.TYPE_CODE_PTR:
+    if val.type.strip_typedefs().code == gdb.TYPE_CODE_PTR:
         return int(val)
     if val.address:
         return int(val.address)
@@ -188,6 +325,37 @@ def has_field(val: gdb.Value, name: str) -> bool:
     return type_has_field(val.type, name)
 
 
+def basic_typename(typ: gdb.Type) -> str:
+    """Return the name of a type without cv-qualifiers, typedefs and references ('' if none)."""
+    typ = gdb.types.get_basic_type(typ)
+    return typ.tag or typ.name or ''
+
+
+template_name_re = re.compile(r'^([\w:]+)<')
+inline_namespace_re = re.compile(r'^std::__\w+::')  # libc++ std::__1::, versioned std::__8::
+
+
+def template_name(typ: gdb.Type) -> str:
+    """Return the template name of a type, e.g. 'std::unique_ptr' ('' if none).
+
+    Without cv-qualifiers, typedefs, references and inline namespaces."""
+    match = template_name_re.match(basic_typename(typ))
+    return inline_namespace_re.sub('std::', match.group(1)) if match else ''
+
+
+def scalar_value(val: gdb.Value) -> int:
+    """Return the integer value of a wrapper like QAtomicInt or std::atomic<int>."""
+    for _ in range(maxdepth):
+        typ = val.type.strip_typedefs()
+        if typ.code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+            return int(val)
+        field = next((f for f in typ.fields() if hasattr(f, 'bitpos')), None)  # first non static field
+        if field is None:
+            break
+        val = val.cast(field.type) if field.is_base_class else val[field]
+    raise gdb.error(f'no integer in {val.type}')
+
+
 def error_text(e: Exception) -> str:
     """Return a short error text to be shown instead of a value."""
     return f'<Fehler: {e}>'
@@ -205,6 +373,8 @@ def pp(val: gdb.Value) -> str:
         return '...'
     pp_depth += 1
     try:
+        if not isinstance(val, gdb.Value):  # e.g. a child given as Python string
+            return str(val)
         v = gdb.default_visualizer(val)
         if v is None:
             return str(val)
@@ -236,6 +406,7 @@ def struct_children(val: gdb.Value):
         fields = val.type.strip_typedefs().fields()
     except Exception:
         return
+    anon = 0
     for f in fields:
         if not hasattr(f, 'bitpos'):  # static member
             continue
@@ -243,7 +414,11 @@ def struct_children(val: gdb.Value):
             if f.is_base_class:
                 yield f.name, val.cast(f.type)
             else:
-                yield f.name or '<anon>', val[f]
+                name = f.name
+                if not name:  # child names must be unique (gdb/MI)
+                    anon += 1
+                    name = '<anon>' if anon == 1 else f'<anon{anon}>'
+                yield name, val[f]
         except Exception:
             continue
 
@@ -273,20 +448,42 @@ def safe_to_string(fn):
 
 
 def safe_children(fn):
-    """Wrap children(): stop at the first error instead of raising."""
+    """Wrap children(): stop at the first error instead of raising.
+
+    The error is shown as an additional child '<Fehler>'; a map gets a
+    complete key/value pair instead. Child names must be unique strings
+    (gdb/MI: 'Duplicate variable object name'), so duplicates get a suffix."""
     @functools.wraps(fn)
     def wrapper(self):
+        n = 0
+        names = set()
         try:
-            for child in fn(self):
-                yield child
-        except Exception:
-            return
+            for name, value in fn(self):
+                name = str(name)
+                if name in names:
+                    name = f'{name}#{n}'
+                names.add(name)
+                yield name, value
+                n += 1
+        except Exception as e:
+            text = error_text(e)
+            try:
+                is_map = self.display_hint() == 'map'
+            except Exception:
+                is_map = False
+            if not is_map:
+                yield '<Fehler>', text
+            elif n % 2 == 0:  # key and value
+                yield '<Fehler>', '<Fehler>'
+                yield '<Text>', text
+            else:  # value of the last key
+                yield '<Text>', text
     wrapper.safe = True
     return wrapper
 
 
 def safe_display_hint(fn):
-    """Wrap display_hint(): no hint instead of raising."""
+    """Wrap display_hint() (or num_children()): None instead of raising."""
     @functools.wraps(fn)
     def wrapper(self):
         try:
@@ -298,11 +495,18 @@ def safe_display_hint(fn):
 
 
 def safe_printer(cls):
-    """Make to_string(), children() and display_hint() of a printer class exception safe."""
+    """Make to_string(), children(), display_hint() and num_children() of a
+    printer class exception safe.
+
+    Inherited methods, too (foreign printers like libstdc++'s). Idempotent."""
     for name, wrap in (('to_string', safe_to_string),
                        ('children', safe_children),
-                       ('display_hint', safe_display_hint)):
-        fn = cls.__dict__.get(name)
+                       ('display_hint', safe_display_hint),
+                       ('num_children', safe_display_hint)):  # gdb >= 14 (DAP): None = count children
+        raw = next((c.__dict__[name] for c in cls.__mro__ if name in c.__dict__), None)
+        if isinstance(raw, (staticmethod, classmethod)):  # would get self as argument
+            continue
+        fn = getattr(cls, name, None)
         if callable(fn) and not getattr(fn, 'safe', False):
             setattr(cls, name, wrap(fn))
     return cls
@@ -318,6 +522,54 @@ class SafeRegexpCollectionPrettyPrinter(gdb.printing.RegexpCollectionPrettyPrint
             return super().__call__(val)
         except Exception:
             return None
+    __call__.safe = True
+
+
+def safe_lookup(fn):
+    """Wrap a lookup function (or __call__ of a printer collection): no printer
+    (None) instead of raising. The class of a found printer is made safe, too."""
+    @functools.wraps(fn)
+    def wrapper(*args):
+        try:
+            printer = fn(*args)
+        except Exception:
+            return None
+        if printer is not None:
+            with contextlib.suppress(Exception):
+                safe_printer(type(printer))
+        return printer
+    wrapper.safe = True
+    return wrapper
+
+
+def harden_printers(printers: list):
+    """Make the foreign printers of a printer list (e.g. libstdc++) exception safe. Idempotent."""
+    for i, printer in enumerate(printers):
+        try:
+            if getattr(printer, 'safe', False):  # own or already hardened
+                continue
+            if isinstance(printer, (types.FunctionType, types.MethodType)):  # lookup function
+                printers[i] = safe_lookup(printer)
+                continue
+            cls = type(printer)  # printer collection: __call__ is the lookup
+            if not getattr(cls.__call__, 'safe', False):
+                cls.__call__ = safe_lookup(cls.__call__)
+            subprinters = []
+            for name in ('subprinters', '_subprinters', 'lookup', '_lookup'):
+                subs = getattr(printer, name, None)
+                if isinstance(subs, dict):
+                    subprinters.extend(subs.values())
+                elif isinstance(subs, (list, tuple)):
+                    subprinters.extend(subs)
+            for sp in subprinters:
+                # gen_printer: gdb.printing.RegexpCollectionPrettyPrinter, (_)function: libstdc++
+                for name in ('gen_printer', 'function', '_function'):
+                    gen = getattr(sp, name, None)
+                    if isinstance(gen, type):
+                        safe_printer(gen)
+            printer.safe = True
+        except Exception:
+            continue
 
 
 # STL pretty printers
@@ -330,10 +582,54 @@ if len(path) == 0:
     path = glob.glob('/usr/share/*/*/*/python/libstdcxx/v6/printers.py')
 if len(path) > 0:
     sys.path.insert(0, path[0][:-25])
-    from libstdcxx.v6.printers import register_libstdcxx_printers
-    register_libstdcxx_printers(None)
+    try:  # made exception safe by harden_all_printers() at the end
+        from libstdcxx.v6.printers import register_libstdcxx_printers
+        register_libstdcxx_printers(None)
+    except Exception as e:  # keep the other printers
+        print(f'libstdc++ pretty printers not loaded: {e}')
 else:
-    print('libstc++ pretty printers not found')
+    print('libstdc++ pretty printers not found')
+
+
+# Qt and boost smart pointers (the std ones are shown by libstdc++)
+
+
+@trace_class
+class SmartPointerPrinter:
+    """Pretty printer for Qt and boost smart pointers (when deref shows no target)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+        self.name = template_name(val.type)
+        self.ptr = smart_pointers[self.name](val)  # None: object deleted / expired
+
+    def counts(self) -> str:
+        """Return the reference counts as text ('' if none)."""
+        if self.name in ('QSharedPointer', 'QWeakPointer'):
+            d = self.val['d']
+            if int(d) != 0:
+                return f" (strong {scalar_value(d['strongref'])}, weak {scalar_value(d['weakref'])})"
+        elif self.name in ('boost::shared_ptr', 'boost::weak_ptr'):
+            pi = self.val['pn']['pi_']
+            if int(pi) != 0:
+                return f" (use count {scalar_value(pi['use_count_'])}, weak count {scalar_value(pi['weak_count_'])})"
+        return ''
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        if self.ptr is None:
+            target = '<expired>'
+        elif int(self.ptr) == 0:
+            target = '<null>'
+        else:
+            target = f'{int(self.ptr):#x}'
+        return f'{self.name} {target}{self.counts()}'
+
+    def children(self):
+        """Return the raw pointer."""
+        if self.ptr is not None and int(self.ptr) != 0:
+            yield 'data', self.ptr
 
 
 # Boost pretty printers
@@ -377,12 +673,11 @@ class BoostUnorderedMapPrinter:
         """Convert value to string."""
         return f"map of size {int(self.val['table_']['size_'])}"
 
-    def children(self):
-        """Return an interator to map content."""
+    def values(self):
+        """Return an interator to the stored values (pairs for a map)."""
         table = self.val['table_']
         buckets_arr = table['buckets_']
-        # at most maxchildren entries (two children each); visited guards
-        # against cyclic node chains
+        # at most maxchildren values; visited guards against cyclic node chains
         count = min(int(table['size_']), maxchildren)
         visited = set()
 
@@ -392,16 +687,14 @@ class BoostUnorderedMapPrinter:
             buckets = buckets_arr['buckets']
             n = 0
             for i in range(int(buckets_arr['size_'])):
-                if n >= 2 * count:
+                if n >= count:
                     return
                 node_ptr = (buckets + i).dereference()['next']
-                while int(node_ptr) != 0 and int(node_ptr) not in visited and n < 2 * count:
+                while int(node_ptr) != 0 and int(node_ptr) not in visited and n < count:
                     visited.add(int(node_ptr))
                     node = node_ptr.dereference()
-                    pair = node['buf']['t_']
-                    yield str(n), pair['first']
-                    yield str(n+1), pair['second']
-                    n += 2
+                    yield node['buf']['t_']
+                    n += 1
                     node_ptr = node['next']
             return
 
@@ -410,7 +703,7 @@ class BoostUnorderedMapPrinter:
         allocators_type = table['allocators_'].type
         node_allocator_type = allocators_type.template_argument(1)
         node_type = node_allocator_type.template_argument(0)
-        pair_type = node_type.template_argument(0)
+        value_type = node_type.template_argument(0)
 
         # find first node
         buckets = table['buckets_']
@@ -418,19 +711,41 @@ class BoostUnorderedMapPrinter:
         node_ptr = first_node['next_']
 
         n = 0
-        while int(node_ptr) != 0 and int(node_ptr) not in visited and n < 2 * count:
+        while int(node_ptr) != 0 and int(node_ptr) not in visited and n < count:
             visited.add(int(node_ptr))
             node = node_ptr.dereference()
             node_ptr = node['next_']
             buf = node.cast(node_type)['value_base_']['data_']['data_']['buf']
-            pair = buf.dereference().cast(pair_type)
-            yield str(n), pair['first']
-            yield str(n+1), pair['second']
-            n += 2
+            yield buf.dereference().cast(value_type)
+            n += 1
+
+    def children(self):
+        """Return an interator to map content."""
+        for n, pair in enumerate(self.values()):
+            yield str(2 * n), pair['first']
+            yield str(2 * n + 1), pair['second']
 
     def display_hint(self):
         """Return display hint (string/array/map)."""
         return 'map'
+
+
+@trace_class
+class BoostUnorderedSetPrinter(BoostUnorderedMapPrinter):
+    """Pretty Printer for boost::unordered_set."""
+
+    def to_string(self):
+        """Convert value to string."""
+        return f"set of size {int(self.val['table_']['size_'])}"
+
+    def children(self):
+        """Return an interator to set content."""
+        for n, value in enumerate(self.values()):
+            yield str(n), value
+
+    def display_hint(self):
+        """Return display hint (string/array/map)."""
+        return 'array'
 
 
 @trace
@@ -439,6 +754,8 @@ def build_boost_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
     pp = SafeRegexpCollectionPrettyPrinter('Boost')
     pp.add_printer('Optional', '^boost::optional<.*$', BoostOptionalPrinter)
     pp.add_printer('UnorderedMap', '^boost::unordered::unordered_map<.*$', BoostUnorderedMapPrinter)
+    pp.add_printer('UnorderedSet', '^boost::unordered::unordered_set<.*$', BoostUnorderedSetPrinter)
+    pp.add_printer('SmartPointer', '^boost::(shared_ptr|weak_ptr|scoped_ptr|intrusive_ptr)<.*$', SmartPointerPrinter)
     for sp in pp.subprinters:
         safe_printer(sp.gen_printer)
     return pp
@@ -634,6 +951,7 @@ class QListIterator:
             self.ptr_size = gdb.lookup_type('void').pointer().sizeof
             self.count = int(d['end'])
             self.i = int(d['begin'])
+        self.begin = self.i  # child names count from 0
         self.count = min(self.count, self.i + maxchildren)
 
     def __next__(self):
@@ -643,7 +961,7 @@ class QListIterator:
         i = self.i
         self.i += 1
         if self.qt6:
-            return (str(i), (self.data + i).dereference())
+            return (str(i - self.begin), (self.data + i).dereference())
         node = self.d['array'][i]
         if self.element_type.sizeof > self.ptr_size:
             # shortcut: movability not detectable in gdb; assumes every large
@@ -651,7 +969,7 @@ class QListIterator:
             elem = node.cast(self.element_type.pointer()).dereference()
         else:
             elem = node.address.cast(self.element_type.pointer()).dereference()
-        return (str(i), elem)
+        return (str(i - self.begin), elem)
 
 
 @trace_class
@@ -684,13 +1002,50 @@ class QListPrinter:
         return 'array'
 
 
+# QMetaType::Type (Qt5) -> type name, for the types QVariantPrinter shows
+qvariant_types = {
+    1: 'bool', 2: 'int', 3: 'unsigned int', 4: 'long long', 5: 'unsigned long long', 6: 'double',
+    7: 'QChar', 8: 'QVariantMap', 9: 'QVariantList', 10: 'QString', 11: 'QStringList',
+    12: 'QByteArray', 14: 'QDate', 15: 'QTime', 16: 'QDateTime', 28: 'QVariantHash',
+    32: 'long', 33: 'short', 34: 'char', 35: 'unsigned long', 36: 'unsigned short',
+    37: 'unsigned char', 38: 'float', 40: 'signed char',
+}
+
+# typedef -> the type itself, if only that is in the debug info
+qvariant_typedefs = {
+    'QVariantMap': ('QMap<QString, QVariant>',),
+    'QVariantList': ('QList<QVariant>',),
+    'QVariantHash': ('QHash<QString, QVariant>',),
+}
+
+
 @trace_class
 class QVariantPrinter:
-    """Pretty printer for QVariant (WIP)."""
+    """Pretty printer for QVariant (Qt5: types from qvariant_types)."""
 
     def __init__(self, val: gdb.Value):
         """Initialize."""
         self.val = val
+
+    def value(self):
+        """Return type name and stored value (None: type not shown)."""
+        d = self.val['d']
+        typ = int(d['type'])
+        name = qvariant_types.get(typ)
+        if name is None:
+            return f'type {typ}', None
+        stored_type = None
+        for typename in (name,) + qvariant_typedefs.get(name, ()):
+            with contextlib.suppress(Exception):  # not in the debug info
+                stored_type = gdb.lookup_type(typename)
+                break
+        if stored_type is None:
+            return name, None
+        if d['is_shared']:  # too big for the data union: separate allocation
+            addr = d['data']['shared']['ptr']
+        else:
+            addr = d['data'].address
+        return name, addr.cast(stored_type.pointer()).dereference()
 
     def to_string(self) -> str:
         """Convert value to string."""
@@ -701,8 +1056,251 @@ class QVariantPrinter:
 
         if typ == 0:
             return '<invalid QVariant>'
-        else:
-            return '<TODO>'
+        name, value = self.value()
+        if value is None:
+            return f'<QVariant {name}>'
+        return f'({name}) {pp(value)}'
+
+    def children(self):
+        """Return the stored value."""
+        d = self.val['d']
+        if has_field(d, 'type') and int(d['type']) != 0:
+            _, value = self.value()
+            if value is not None:
+                yield 'value', value
+
+
+def qt5_array_data(d: gdb.Value, elem_type: gdb.Type) -> gdb.Value:
+    """Return a pointer to the elements of a Qt5 QArrayData (QByteArray, QVector)."""
+    offset = int(d['offset'])  # byte offset from d to the elements
+    return (d.cast(gdb.lookup_type('char').pointer()) + offset).cast(elem_type.pointer())
+
+
+def align(offset: int, typ: gdb.Type) -> int:
+    """Round a byte offset up to the alignment of a type."""
+    alignment = getattr(typ, 'alignof', 0) or min(typ.sizeof, gdb.lookup_type('void').pointer().sizeof) or 1
+    return (offset + alignment - 1) // alignment * alignment
+
+
+def value_at(ptr: gdb.Value, offset: int, typ: gdb.Type) -> gdb.Value:
+    """Return the value of a type at a byte offset from a pointer."""
+    return (ptr.cast(gdb.lookup_type('char').pointer()) + offset).cast(typ.pointer()).dereference()
+
+
+@trace_class
+class QByteArrayPrinter:
+    """Pretty printer for QByteArray."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        d = self.val['d']
+        size = int(d['size'])
+        if has_field(d, 'ptr'):  # Qt6: DataPointer {d, ptr, size}
+            data = d['ptr']
+        elif has_field(d, 'offset'):  # Qt5: QArrayData with byte offset
+            data = qt5_array_data(d, gdb.lookup_type('char'))
+        else:  # Qt4: inline data pointer
+            data = d['data']
+        result = bytes(int((data + i).dereference()) & 0xff for i in range(min(size, maxstrlen)))
+        text = result.decode('utf-8', errors='replace')
+        if size > maxstrlen:
+            text += '[...]'
+        return text
+
+    def display_hint(self) -> str:
+        """Return display hint (string/array/map)."""
+        return 'string'
+
+
+@trace_class
+class QStringListPrinter(QListPrinter):
+    """Pretty printer for QStringList (Qt5: derived from QList<QString>, Qt6: a typedef)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        base = next(f for f in gdb.types.get_basic_type(val.type).fields() if f.is_base_class)
+        super().__init__(val.cast(base.type))
+
+
+@trace_class
+class QVectorPrinter:
+    """Pretty printer for QVector (Qt5; in Qt6 QVector is QList)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+        if not has_field(self.val['d'], 'offset'):
+            raise gdb.error('QVector: Qt5 only')  # no printer: shown natively
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        return f"QVector with {int(self.val['d']['size'])} elements"
+
+    def children(self):
+        """Return an interator to vector content."""
+        elem_type = self.val.type.strip_typedefs().template_argument(0)
+        d = self.val['d']
+        data = qt5_array_data(d, elem_type)
+        for i in range(min(int(d['size']), maxchildren)):
+            yield str(i), (data + i).dereference()
+
+    def display_hint(self):
+        """Return display hint (string/array/map)."""
+        return 'array'
+
+
+@trace_class
+class QPairPrinter:
+    """Pretty printer for QPair (Qt5; in Qt6 QPair is std::pair)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        return f"({pp(self.val['first'])}, {pp(self.val['second'])})"
+
+    def children(self):
+        """Return first and second."""
+        yield 'first', self.val['first']
+        yield 'second', self.val['second']
+
+
+@trace_class
+class QMapPrinter:
+    """Pretty printer for QMap (Qt5)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+        if not has_field(self.val['d'], 'header'):
+            raise gdb.error('QMap: Qt5 only')  # no printer: shown natively
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        return f"QMap with {int(self.val['d']['size'])} elements"
+
+    def children(self):
+        """Return an interator to map content."""
+        typ = self.val.type.strip_typedefs()
+        key_type = typ.template_argument(0)
+        value_type = typ.template_argument(1)
+        # QMapNode<Key, T> : QMapNodeBase {quintptr p; left; right;} {Key key; T value;}
+        key_offset = align(3 * gdb.lookup_type('void').pointer().sizeof, key_type)
+        value_offset = align(key_offset + key_type.sizeof, value_type)
+        d = self.val['d']
+        count = min(int(d['size']), maxchildren)
+        # in-order walk of the red-black tree; visited guards against cycles
+        stack = []
+        visited = set()
+        node = d['header']['left']  # root
+        n = 0
+        while n < count:
+            while int(node) != 0:
+                if int(node) in visited or len(visited) > count + 128:
+                    raise gdb.error('QMap: invalid tree')
+                visited.add(int(node))
+                stack.append(node)
+                node = node['left']
+            if not stack:
+                return
+            node = stack.pop()
+            yield str(2 * n), value_at(node, key_offset, key_type)
+            yield str(2 * n + 1), value_at(node, value_offset, value_type)
+            n += 1
+            node = node['right']
+
+    def display_hint(self):
+        """Return display hint (string/array/map)."""
+        return 'map'
+
+
+def qt5_hash_nodes(d: gdb.Value, count: int):
+    """Return an iterator to the first count nodes of a Qt5 QHashData."""
+    end = int(d)  # the QHashData itself ends each bucket chain
+    buckets = d['buckets']
+    visited = set()
+    n = 0
+    for i in range(int(d['numBuckets'])):
+        if n >= count:
+            return
+        node = (buckets + i).dereference()
+        while int(node) not in (0, end) and n < count:
+            if int(node) in visited:
+                raise gdb.error('QHash: cyclic bucket chain')
+            visited.add(int(node))
+            yield node
+            n += 1
+            node = node['next']
+
+
+def qt5_hash_key_offset(key_type: gdb.Type) -> int:
+    """Return the byte offset of the key in a Qt5 QHashNode."""
+    # QHashNode<Key, T> {QHashNode *next; const uint h; const Key key; T value;}
+    return align(gdb.lookup_type('void').pointer().sizeof + gdb.lookup_type('unsigned int').sizeof, key_type)
+
+
+@trace_class
+class QHashPrinter:
+    """Pretty printer for QHash (Qt5)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+        if not has_field(self.val['d'], 'buckets'):  # Qt6: spans
+            raise gdb.error('QHash: Qt5 only')  # no printer: shown natively
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        return f"QHash with {int(self.val['d']['size'])} elements"
+
+    def children(self):
+        """Return an interator to hash content."""
+        typ = self.val.type.strip_typedefs()
+        key_type = typ.template_argument(0)
+        value_type = typ.template_argument(1)
+        key_offset = qt5_hash_key_offset(key_type)
+        value_offset = align(key_offset + key_type.sizeof, value_type)
+        d = self.val['d']
+        for n, node in enumerate(qt5_hash_nodes(d, min(int(d['size']), maxchildren))):
+            yield str(2 * n), value_at(node, key_offset, key_type)
+            yield str(2 * n + 1), value_at(node, value_offset, value_type)
+
+    def display_hint(self):
+        """Return display hint (string/array/map)."""
+        return 'map'
+
+
+@trace_class
+class QSetPrinter:
+    """Pretty printer for QSet (Qt5: QHash<T, QHashDummyValue>)."""
+
+    def __init__(self, val: gdb.Value):
+        """Initialize."""
+        self.val = val
+        if not has_field(self.val['q_hash']['d'], 'buckets'):  # Qt6: spans
+            raise gdb.error('QSet: Qt5 only')  # no printer: shown natively
+
+    def to_string(self) -> str:
+        """Convert value to string."""
+        return f"QSet with {int(self.val['q_hash']['d']['size'])} elements"
+
+    def children(self):
+        """Return an interator to set content."""
+        key_type = self.val.type.strip_typedefs().template_argument(0)
+        key_offset = qt5_hash_key_offset(key_type)
+        d = self.val['q_hash']['d']
+        for n, node in enumerate(qt5_hash_nodes(d, min(int(d['size']), maxchildren))):
+            yield str(n), value_at(node, key_offset, key_type)
+
+    def display_hint(self):
+        """Return display hint (string/array/map)."""
+        return 'array'
 
 
 @trace
@@ -715,6 +1313,14 @@ def build_qt_pretty_printer() -> gdb.printing.RegexpCollectionPrettyPrinter:
     pp.add_printer('QString', '^QString$', QStringPrinter)
     pp.add_printer('QVariant', '^QVariant$', QVariantPrinter)
     pp.add_printer('QList', '^QList<.*>$', QListPrinter)
+    pp.add_printer('QByteArray', '^QByteArray$', QByteArrayPrinter)
+    pp.add_printer('QStringList', '^QStringList$', QStringListPrinter)
+    pp.add_printer('QVector', '^QVector<.*>$', QVectorPrinter)
+    pp.add_printer('QPair', '^QPair<.*>$', QPairPrinter)
+    pp.add_printer('QMap', '^QMap<.*>$', QMapPrinter)
+    pp.add_printer('QHash', '^QHash<.*>$', QHashPrinter)
+    pp.add_printer('QSet', '^QSet<.*>$', QSetPrinter)
+    pp.add_printer('SmartPointer', '^(Q(Shared|Weak|Scoped)Pointer|QPointer)<.*>$', SmartPointerPrinter)
     for sp in pp.subprinters:
         safe_printer(sp.gen_printer)
     return pp
@@ -746,58 +1352,115 @@ class DynamicPtrPrinter:
         return struct_children(obj)
 
 
+@safe_printer
+class AddrPrinter:
+    """Printer of a dereferenced value with its address in front (printaddr)."""
+
+    def __init__(self, printer, ptr: gdb.Value):
+        self.printer = printer
+        self.ptr = ptr
+        if hasattr(printer, 'children'):
+            self.children = printer.children
+
+    def to_string(self):
+        s = self.printer.to_string() if hasattr(self.printer, 'to_string') else None
+        if isinstance(s, gdb.LazyString):
+            s = s.value()
+        addr = f'@{int(self.ptr):#x}'
+        return addr if s is None else f'{addr}: {s}'
+
+    def display_hint(self):
+        hint = self.printer.display_hint() if hasattr(self.printer, 'display_hint') else None
+        return None if hint == 'string' else hint  # 'string' would quote the address, too
+
+
+def addr_printer(printer, ptr: gdb.Value):
+    """Return printer; with printaddr its to_string() shows the address ptr in front."""
+    if printaddr and printer is not None and ptr is not None:
+        return AddrPrinter(printer, ptr)
+    return printer
+
+
+def deref_target(target: gdb.Value, ptr: gdb.Value):
+    """Return the printer for the target of a dereference of ptr (None: no printer)."""
+    if deref_probe:
+        target.fetch_lazy()  # unreadable memory raises: show the pointer natively
+    return addr_printer(gdb.default_visualizer(target), ptr)
+
+
+# current nesting depth of deref_printers()
+deref_depth = 0
+
+
 @trace
 def deref_printers(val: gdb.Value):
     """Auto dereference pointers, references and typdefs."""
-    if not deref:
+    global deref_depth
+    if not deref or deref_depth >= maxdepth:
         return None
     # Must never raise (see safe_printer). Without a printer of our own
-    # (None) gdb shows the value natively.
+    # (None) gdb shows the value natively. As the first printer it sees
+    # every value: everything else returns None quickly.
+    deref_depth += 1
     try:
-        if val.type.code == gdb.TYPE_CODE_PTR:
+        typ = val.type
+        if typ.code == gdb.TYPE_CODE_TYPEDEF:
+            # typedef'd structs: the other printers strip typedefs themselves
+            typ = typ.strip_typedefs()
+            if typ.code not in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF,
+                                gdb.TYPE_CODE_STRUCT):
+                return None
+            val = val.cast(typ)
+        if typ.code == gdb.TYPE_CODE_PTR:
             if int(val) == 0:
                 return None
-            # cast to derived type
-            if val.dynamic_type != val.type:
-                derived = val.cast(val.dynamic_type).dereference()
-                derived.fetch_lazy()  # unreadable memory: show the pointer natively
+            target_type = typ.target().unqualified().strip_typedefs()
+            # cast to derived type (dynamic_type drops cv-qualifiers)
+            dyn = val.dynamic_type
+            if dyn.target().unqualified().strip_typedefs() != target_type:
+                derived = val.cast(dyn).dereference()
+                if deref_probe:
+                    derived.fetch_lazy()  # unreadable memory: show the pointer natively
                 printer = gdb.default_visualizer(derived)
-                return printer if printer is not None else DynamicPtrPrinter(val)
-            # dereference pointers (except void*)
-            if val.type.target().strip_typedefs().code != gdb.TYPE_CODE_VOID:
-                target = val.referenced_value()
-                target.fetch_lazy()
-                return gdb.default_visualizer(target)
+                return addr_printer(printer, val) if printer is not None else DynamicPtrPrinter(val)
+            # dereference pointers (except void* and function pointers)
+            if target_type.code not in (gdb.TYPE_CODE_VOID, gdb.TYPE_CODE_FUNC):
+                return deref_target(val.referenced_value(), val)
             return None
-        if val.type.code == gdb.TYPE_CODE_REF or val.type.code == gdb.TYPE_CODE_RVALUE_REF:
+        if typ.code == gdb.TYPE_CODE_REF or typ.code == gdb.TYPE_CODE_RVALUE_REF:
             target = val.referenced_value()
             dyn = target.dynamic_type
             if dyn.strip_typedefs().unqualified() != target.type.strip_typedefs().unqualified():
                 target = target.cast(dyn)
-            target.fetch_lazy()
-            return gdb.default_visualizer(target)
-        if val.type.code == gdb.TYPE_CODE_TYPEDEF:
-            return gdb.default_visualizer(val.cast(val.type.strip_typedefs()))
-        typename = str(val.type)
-        if typename.startswith('std::shared_ptr<'):
-            ptr = dereference_shared_ptr(val)
-        elif typename.startswith('std::unique_ptr<'):
-            ptr = dereference_unique_ptr(val)
-        elif typename.startswith('std::weak_ptr<'):
-            ptr = dereference_weak_ptr(val)
-        else:
+            return deref_target(target, target.address)
+        if typ.code != gdb.TYPE_CODE_STRUCT:
             return None
-        if int(ptr) == 0:
+        # smart pointers (std, Qt, boost; also const, typedef'd, libc++)
+        tag = typ.tag or ''
+        if '_ptr<' not in tag and 'Pointer<' not in tag:  # quick exit for all other structs
             return None
-        target = ptr.dereference()
-        target.fetch_lazy()
-        return gdb.default_visualizer(target)
+        get_pointer = smart_pointers.get(template_name(typ))
+        if get_pointer is None:
+            return None
+        ptr = get_pointer(val)
+        if ptr is None or int(ptr) == 0:  # expired or null
+            return None
+        return deref_target(ptr.dereference(), ptr)
     except Exception:
         return None
+    finally:
+        deref_depth -= 1
 
 
-# Needs to be the very first printer.
-gdb.pretty_printers.insert(0, deref_printers)
+deref_printers.safe = True  # harden_printers() leaves it alone
+
+
+def ensure_deref_first():
+    """Keep deref_printers the very first global printer (also after later registrations)."""
+    printers = gdb.pretty_printers
+    if deref_printers in printers and printers[0] is not deref_printers:
+        printers.remove(deref_printers)
+        printers.insert(0, deref_printers)
 
 
 # RailSys pretty printers
@@ -965,9 +1628,10 @@ class UnitPrinter:
         self.val = val
 
     def to_string(self) -> str:
-        if 'Acceleration' in str(self.val.type):
+        typename = basic_typename(self.val.type)  # without typedefs, const, &
+        if 'Acceleration' in typename:
             return str(self.val['m_Value']) + ' m/s^2'
-        elif 'Duration' in str(self.val.type) or 'Time' in str(self.val.type):
+        elif 'Duration' in typename or 'Time' in typename:
             seconds = int(self.val['m_Value'])
             minutes = 0
             hours = 0
@@ -982,7 +1646,7 @@ class UnitPrinter:
             if seconds >= 60:
                 minutes = int(seconds / 60)
                 seconds = seconds - minutes * 60
-            if 'Duration' in str(self.val.type):
+            if 'Duration' in typename:
                 if days > 0:
                     result += str(days) + 'd '
                 if hours > 0:
@@ -991,20 +1655,20 @@ class UnitPrinter:
                     result += str(minutes) + 'm '
                 if seconds > 0 or result == '':
                     result += str(seconds) + 's '
-            elif 'Time' in str(self.val.type):
+            elif 'Time' in typename:
                 if days > 0:
                     result += str(days) + 'd '
                 result += f'{hours:02}:{minutes:02}:{seconds:02}'
             return result
-        elif 'Length' in str(self.val.type):
+        elif 'Length' in typename:
             return str(self.val['m_Value']) + ' m'
-        elif 'Mass' in str(self.val.type):
+        elif 'Mass' in typename:
             return str(self.val['m_Value']) + ' kg'
-        elif 'Speed' in str(self.val.type):
+        elif 'Speed' in typename:
             return str(self.val['m_Value'] * 3.6) + ' km/h'
-        elif 'Force' in str(self.val.type):
+        elif 'Force' in typename:
             return str(self.val['m_Value']) + ' N'
-        elif 'Energy' in str(self.val.type):
+        elif 'Energy' in typename:
             return str(self.val['m_Value']) + ' W'
         return str(self.val['m_Value'])
 
@@ -1142,10 +1806,11 @@ class OpDayNumberCodeGermanPrinter:
             days = days + 'Sa,'
         if wochentage & 0x01:
             days = days + 'So,'
-        if feiertage & 0x10:
-            days = days + '+'
-        else:
-            days = days + '-'
+        if feiertage & 0x0f:  # +/- only together with holidays, else the last ',' is cut
+            if feiertage & 0x10:
+                days = days + '+'
+            else:
+                days = days + '-'
         if feiertage & 0x08:
             days = days + 'vF,'
         if feiertage & 0x04:
@@ -1219,8 +1884,12 @@ class KnotenPrinter:
             return 'Achszähler'
         else:
             try:
-                type_name = self.val.type.name
-                if not type_name:  # e.g. reference type
+                try:
+                    typ = self.val.dynamic_type  # most derived class
+                except Exception:
+                    typ = self.val.type
+                type_name = basic_typename(typ)  # also for references, typedefs, const
+                if not type_name:
                     return 'Unbekannt'
                 colon_pos = type_name.rfind('::')
                 if colon_pos != -1:
@@ -1850,3 +2519,56 @@ def register_rs_printers(obj):
 
 
 register_rs_printers(None)
+
+
+# deref_printers needs to be the very first printer: pointers and references
+# are resolved (to their dynamic type) before any other printer sees them.
+# register_pretty_printer() inserts at the front, so it comes last.
+gdb.pretty_printers.insert(0, deref_printers)
+
+
+# Exception safety of foreign printers (libstdc++), also of those registered
+# later for new objfiles (auto-load of libstdc++.so).
+
+
+def harden_all_printers():
+    """Harden the printers of gdb, the progspaces and the objfiles; keep deref_printers first."""
+    lists = [gdb.pretty_printers]
+    with contextlib.suppress(Exception):
+        lists.append(gdb.current_progspace().pretty_printers)
+    with contextlib.suppress(Exception):
+        lists.extend(objfile.pretty_printers for objfile in gdb.objfiles())
+    with contextlib.suppress(Exception):
+        for progspace in gdb.progspaces():
+            lists.append(progspace.pretty_printers)
+            lists.extend(objfile.pretty_printers for objfile in progspace.objfiles())
+    for printers in lists:
+        with contextlib.suppress(Exception):
+            harden_printers(printers)
+    with contextlib.suppress(Exception):
+        ensure_deref_first()
+
+
+# re-source: replace the hooks of the previous run instead of adding more
+with contextlib.suppress(Exception):
+    gdb.events.new_objfile.disconnect(harden_new_objfile)
+with contextlib.suppress(Exception):
+    gdb.events.stop.disconnect(harden_on_stop)
+
+
+def harden_new_objfile(event):
+    """new_objfile hook: harden the printers registered since (gdb >= 11: after auto-load)."""
+    harden_all_printers()
+
+
+def harden_on_stop(event):
+    """stop hook: catch up before the variables are shown (older gdb may report
+    new_objfile before the auto-load script of the objfile ran)."""
+    harden_all_printers()
+
+
+with contextlib.suppress(Exception):
+    gdb.events.new_objfile.connect(harden_new_objfile)
+with contextlib.suppress(Exception):
+    gdb.events.stop.connect(harden_on_stop)
+harden_all_printers()
